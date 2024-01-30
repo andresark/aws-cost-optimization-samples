@@ -1,106 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
+
+// This CloudFormation template enforces work hours for AWS instances by automatically starting and stopping them based on a schedule.
+// It includes three Lambda functions: StartAutoStartInstancesFunction, WriteAutostopTagFunction, and StopsAutoStopInstancesFunction.
+// The StartAutoStartInstancesFunction starts instances with the 'autostart' tag set to 'yes' during work hours.
+// The WriteAutostopTagFunction tags instances with the 'autostop' tag set to 'yes' outside of work hours.
+// The StopsAutoStopInstancesFunction stops instances with the 'autostop' tag set to 'yes' at the end of work hours.
+// These functions are triggered by AWS Events Rules: StartAutoStartInstancesEvent, WriteAutostopTagEvent, and StopsAutoStopInstancesEvent.
+// The template also includes IAM roles and permissions required for the Lambda functions to interact with EC2 instances.
 Resources:
-  StartInstancesFunction:
-    Type: 'AWS::Lambda::Function'
-    Properties:
-      Handler: index.handler
-      Role: !GetAtt 'LambdaExecutionRole.Arn'
-      Code:
-        ZipFile: |
-          var AWS = require('aws-sdk');
-          var ec2 = new AWS.EC2();
-          exports.handler = function(event, context) {
-            var params = {
-              Filters: [
-                {
-                  Name: 'tag:autostart',
-                  Values: ['yes']
-                }
-              ]
-            };
-            ec2.describeInstances(params, function(err, data) {
-              if (err) {
-                console.log(err, err.stack);
-                context.fail(err);
-              } else {
-                var instanceIds = [];
-                data.Reservations.forEach(function(reservation) {
-                  reservation.Instances.forEach(function(instance) {
-                    instanceIds.push(instance.InstanceId);
-                  });
-                });
-                if (instanceIds.length > 0) {
-                  var startParams = {
-                    InstanceIds: instanceIds
-                  };
-                  ec2.startInstances(startParams, function(err, data) {
-                    if (err) {
-                      console.log(err, err.stack);
-                      context.fail(err);
-                    } else {
-                      console.log(data);
-                      context.succeed(data);
-                    }
-                  });
-                } else {
-                  console.log('No instances to start');
-                  context.succeed('No instances to start');
-                }
-              }
-            });
-          };
-      Runtime: nodejs16.x
-  StopInstancesFunction:
-    Type: 'AWS::Lambda::Function'
-    Properties:
-      Handler: index.handler
-      Role: !GetAtt 'LambdaExecutionRole.Arn'
-      Code:
-        ZipFile: |
-          var AWS = require('aws-sdk');
-          var ec2 = new AWS.EC2();
-          exports.handler = function(event, context) {
-            var params = {
-              Filters: [
-                {
-                  Name: 'tag:autostop',
-                  Values: ['no']
-                }
-              ]
-            };
-            ec2.describeInstances(params, function(err, data) {
-              if (err) {
-                console.log(err, err.stack);
-                context.fail(err);
-              } else {
-                var instanceIds = [];
-                data.Reservations.forEach(function(reservation) {
-                  reservation.Instances.forEach(function(instance) {
-                    instanceIds.push(instance.InstanceId);
-                  });
-                });
-                if (instanceIds.length > 0) {
-                  var stopParams = {
-                    InstanceIds: instanceIds
-                  };
-                  ec2.stopInstances(stopParams, function(err, data) {
-                    if (err) {
-                      console.log(err, err.stack);
-                      context.fail(err);
-                    } else {
-                      console.log(data);
-                      context.succeed(data);
-                    }
-                  });
-                } else {
-                  console.log('No instances to stop');
-                  context.succeed('No instances to stop');
-                }
-              }
-            });
-          };
-      Runtime: nodejs16.x
-  LambdaExecutionRole:
+  StartAutoStartInstancesRole:
     Type: 'AWS::IAM::Role'
     Properties:
       AssumeRolePolicyDocument:
@@ -108,32 +16,249 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - 'sts:AssumeRole'
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: ec2Access
+        - PolicyName: StartInstancesPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - 'ec2:DescribeInstances'
                   - 'ec2:Start*'
-                  - 'ec2:Stop*'
+                  - 'ec2:Describe*'
                 Resource: '*'
-  StartInstancesEvent:
+
+  StartAutoStartInstancesFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt StartAutoStartInstancesRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ec2 = new AWS.EC2();
+
+          exports.handler = async (event) => {
+            try {
+              const params = {
+                Filters: [
+                  {
+                    Name: 'tag:autostart',
+                    Values: ['yes']
+                  }
+                ]
+              };
+
+              const instances = await ec2.describeInstances(params).promise();
+
+              const instanceData = instances.Reservations.map(reservation => reservation.Instances.map(instance => ({
+                id: instance.InstanceId,
+                name: (instance.Tags.find(tag => tag.Key === 'Name') || {}).Value
+              }))).flat();
+
+              if (instanceData.length > 0) {
+                const startParams = {
+                  InstanceIds: instanceData.map(data => data.id)
+                };
+
+                await ec2.startInstances(startParams).promise();
+
+                console.log('Started instances:', instanceData);
+              }
+            } catch (error) {
+              console.error('Error starting instances:', error);
+            }
+
+            return { statusCode: 200 };
+          };
+      Runtime: nodejs14.x
+      Timeout: '15'
+      Environment:
+        Variables:
+          TZ: America/New_York
+
+  StartAutoStartInstancesEvent:
     Type: 'AWS::Events::Rule'
     Properties:
-      ScheduleExpression: 'cron(30 11 ? * MON-FRI *)' # 7:30 AM US Eastern Time
+      ScheduleExpression: 'cron(30 7 * * ? *)'
       Targets:
-        - Arn: !GetAtt 'StartInstancesFunction.Arn'
-          Id: StartInstances
-  StopInstancesEvent:
+        - Arn: !GetAtt StartAutoStartInstancesFunction.Arn
+          Id: StartAutoStartInstancesEventTarget
+
+  WriteAutostopTagRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: WriteAutostopTagPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateTags'
+                  - 'ec2:Describe*'
+                Resource: '*'
+
+  WriteAutostopTagFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt WriteAutostopTagRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ec2 = new AWS.EC2();
+
+          exports.handler = async (event) => {
+            try {
+              const instances = await ec2.describeInstances().promise();
+
+              const instanceData = instances.Reservations.map(reservation => reservation.Instances.map(instance => ({
+                id: instance.InstanceId,
+                name: (instance.Tags.find(tag => tag.Key === 'Name') || {}).Value,
+                autostop: (instance.Tags.find(tag => tag.Key === 'autostop') || {}).Value
+              }))).flat();
+
+              const instancesToTag = instanceData.filter(data => data.autostop !== 'no');
+
+              if (instancesToTag.length > 0) {
+                const tagParams = {
+                  Resources: instancesToTag.map(data => data.id),
+                  Tags: [
+                    {
+                      Key: 'autostop',
+                      Value: 'yes'
+                    }
+                  ]
+                };
+
+                await ec2.createTags(tagParams).promise();
+
+                console.log('Tagged instances:', instancesToTag);
+              }
+            } catch (error) {
+              console.error('Error tagging instances:', error);
+            }
+
+            return { statusCode: 200 };
+          };
+      Runtime: nodejs14.x
+      Timeout: '15'
+      Environment:
+        Variables:
+          TZ: America/New_York
+
+  WriteAutostopTagEvent:
     Type: 'AWS::Events::Rule'
     Properties:
-      ScheduleExpression: 'cron(0 23 ? * * *)' # 7:00 PM US Eastern Time
+      ScheduleExpression: 'cron(0 7 * * ? *)'
       Targets:
-        - Arn: !GetAtt 'StopInstancesFunction.Arn'
-          Id: StopInstances
+        - Arn: !GetAtt WriteAutostopTagFunction.Arn
+          Id: WriteAutostopTagEventTarget
+
+  StopsAutoStopInstancesRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StopInstancesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:Stop*'
+                  - 'ec2:Describe*'
+                Resource: '*'
+
+  StopsAutoStopInstancesFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt StopsAutoStopInstancesRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const ec2 = new AWS.EC2();
+
+          exports.handler = async (event) => {
+            try {
+              const params = {
+                Filters: [
+                  {
+                    Name: 'tag:autostop',
+                    Values: ['yes']
+                  }
+                ]
+              };
+
+              const instances = await ec2.describeInstances(params).promise();
+
+              const instanceData = instances.Reservations.map(reservation => reservation.Instances.map(instance => ({
+                id: instance.InstanceId,
+                name: (instance.Tags.find(tag => tag.Key === 'Name') || {}).Value
+              }))).flat();
+
+              if (instanceData.length > 0) {
+                const stopParams = {
+                  InstanceIds: instanceData.map(data => data.id)
+                };
+
+                await ec2.stopInstances(stopParams).promise();
+
+                console.log('Stopped instances:', instanceData);
+              }
+            } catch (error) {
+              console.error('Error stopping instances:', error);
+            }
+
+            return { statusCode: 200 };
+          };
+      Runtime: nodejs14.x
+      Timeout: '15'
+      Environment:
+        Variables:
+          TZ: America/New_York
+
+  StopsAutoStopInstancesEvent:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: 'cron(0 19 * * ? *)'
+      Targets:
+        - Arn: !GetAtt StopsAutoStopInstancesFunction.Arn
+          Id: StopsAutoStopInstancesEventTarget
+
+  PermissionForEventsToInvokeLambda:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: 
+        - !GetAtt StartAutoStartInstancesFunction.Arn
+        - !GetAtt WriteAutostopTagFunction.Arn
+        - !GetAtt StopsAutoStopInstancesFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: 
+        - !GetAtt StartAutoStartInstancesEvent.Arn
+        - !GetAtt WriteAutostopTagEvent.Arn
+        - !GetAtt StopsAutoStopInstancesEvent.Arn
+// This AWS CloudFormation template deploys a solution for enforcing work hours on AWS EC2 instances.
+// It consists of three AWS Lambda functions and three AWS CloudWatch Events rules.
+// The StartAutoStartInstancesFunction starts EC2 instances that have the "autostart" tag set to "yes" at 7:30 AM every day.
+// The WriteAutostopTagFunction tags EC2 instances that do not have the "autostop" tag set to "no" at 7:00 AM every day.
+// The StopsAutoStopInstancesFunction stops EC2 instances that have the "autostop" tag set to "yes" at 7:00 PM every day.
+// The CloudWatch Events rules trigger the corresponding Lambda functions at the specified schedule.
+// The template also creates the necessary IAM roles and permissions for the Lambda functions and CloudWatch Events rules.
