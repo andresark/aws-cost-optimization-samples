@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+# This CloudFormation template enforces the tagging of EC2 instances with an "autostop" tag.
+# It creates an IAM role and a Lambda function that checks for instances without the "autostop" tag,
+# and tags them with the value "yes" if they are eligible for autostop.
+Resources:
+    CheckAndWriteAutostopTagRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: 'sts:AssumeRole'
+            Policies:
+                - PolicyName: CheckAndWriteAutostopTagPolicy
+                    PolicyDocument:
+                        Version: '2012-10-17'
+                        Statement:
+                            - Effect: Allow
+                                Action:
+                                    - 'ec2:Describe*'
+                                    - 'ec2:CreateTags'
+                                Resource: '*'
+
+    CheckAndWriteAutostopTagFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties:
+            Handler: index.handler
+            Role: !GetAtt CheckAndWriteAutostopTagRole.Arn
+            Code:
+                ZipFile: |
+                    const AWS = require('aws-sdk');
+                    const ec2 = new AWS.EC2();
+
+                    // This Lambda function checks for EC2 instances without the "autostop" tag,
+                    // and tags them with the value "yes" if they are eligible for autostop.
+                    exports.handler = async (event) => {
+                        try {
+                            const instances = await ec2.describeInstances().promise();
+
+                            const instanceData = instances.Reservations.map(reservation => reservation.Instances.map(instance => ({
+                                id: instance.InstanceId,
+                                name: (instance.Tags.find(tag => tag.Key === 'Name') || {}).Value,
+                                autostop: (instance.Tags.find(tag => tag.Key === 'autostop') || {}).Value
+                            }))).flat();
+
+                            const instancesToTag = instanceData.filter(data => data.autostop !== 'no');
+
+                            if (instancesToTag.length > 0) {
+                                const tagParams = {
+                                    Resources: instancesToTag.map(data => data.id),
+                                    Tags: [
+                                        {
+                                            Key: 'autostop',
+                                            Value: 'yes'
+                                        }
+                                    ]
+                                };
+
+                                await ec2.createTags(tagParams).promise();
+
+                                console.log('Tagged instances:', instancesToTag);
+                            }
+                        } catch (error) {
+                            console.error('Error checking and tagging instances:', error);
+                        }
+
+                        return { statusCode: 200 };
+                    };
+            Runtime: nodejs14.x
+            Timeout: '15'
